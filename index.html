@@ -70,7 +70,11 @@
 </div>
 
 <script>
-const SERV = 0xFFE0, CARAC = 0xFFE1;
+// Servicios BLE mas comunes de los modulos serie (HM-10, BT05, AT-09, JDY, HC-08, Nordic UART)
+const SERVICIOS = [0xFFE0, 0xFFF0, 0xFFE5, 0xFFB0, 0x1101, 0x0001,
+  '6e400001-b5a3-f393-e0a9-e50e24dcca9e', '0000fff0-0000-1000-8000-00805f9b34fb',
+  '49535343-fe7d-4ae5-8fa9-9fafd205e455'];
+let carTx = null;
 let disp = null, car = null, buffer = '', sonando = false, silenciado = false, ctx = null, osc = null, ganancia = null, sirenaTimer = null, wake = null, ultimoDato = 0;
 const $ = id => document.getElementById(id);
 
@@ -136,8 +140,23 @@ function procesarLinea(linea) {
   }
   if (!/^=+/.test(linea) && !/OMNI LABEL/.test(linea)) log(linea);
 }
+let recibidos = 0;
 function recibir(ev) {
-  buffer += new TextDecoder().decode(ev.target.value);
+  const txt = new TextDecoder().decode(ev.target.value);
+  recibidos++;
+  if (recibidos <= 3) log('Llegó: ' + JSON.stringify(txt));
+  buffer += txt;
+  // Formato del panel (*T38.5*S91*...): tambien se entiende
+  let m; const re = /\*([TSVBE])([^*]*)\*/g;
+  while ((m = re.exec(buffer))) {
+    const v = m[2];
+    if (m[1] === 'T') procesarLinea('Temp: ' + v);
+    if (m[1] === 'S') procesarLinea('Salud: ' + v + ' %');
+    if (m[1] === 'V') procesarLinea('Vibracion: ' + v);
+    if (m[1] === 'B') procesarLinea('Botellas: ' + v);
+    if (m[1] === 'E') procesarLinea('Estado: ' + v);
+  }
+  buffer = buffer.replace(/\*[TSVBE][^*]*\*/g, '');
   let i;
   while ((i = buffer.search(/[\r\n]/)) >= 0) {
     procesarLinea(buffer.slice(0, i)); buffer = buffer.slice(i + 1);
@@ -150,12 +169,25 @@ async function conectar() {
   audioListo();   // habilita el sonido con este toque
   try {
     estado('BUSCANDO…', '', 'Elegí tu módulo en la lista');
-    disp = await navigator.bluetooth.requestDevice({ acceptAllDevices: true, optionalServices: [SERV] });
+    disp = await navigator.bluetooth.requestDevice({ acceptAllDevices: true, optionalServices: SERVICIOS });
     disp.addEventListener('gattserverdisconnected', desconectado);
     estado('CONECTANDO…', '', disp.name || 'módulo');
     const srv = await disp.gatt.connect();
-    const s = await srv.getPrimaryService(SERV);
-    car = await s.getCharacteristic(CARAC);
+    car = null; carTx = null;
+    const servs = await srv.getPrimaryServices();
+    for (const sv of servs) {
+      let cs = [];
+      try { cs = await sv.getCharacteristics(); } catch (e) { continue; }
+      for (const c of cs) {
+        const p = c.properties;
+        log('Servicio ' + sv.uuid.slice(4, 8) + ' / caract. ' + c.uuid.slice(4, 8) + (p.notify ? ' [notifica]' : '') + (p.write || p.writeWithoutResponse ? ' [escribe]' : ''));
+        if (!car && (p.notify || p.indicate)) car = c;
+        if (!carTx && (p.write || p.writeWithoutResponse)) carTx = c;
+      }
+      if (car) break;
+    }
+    if (!car) throw new Error('el modulo no tiene un canal para recibir datos');
+    if (!carTx) carTx = car;
     await car.startNotifications();
     car.addEventListener('characteristicvaluechanged', recibir);
     estado('CONECTADO', 'ok', 'Esperando el primer reporte…');
@@ -171,7 +203,11 @@ function desconectado() {
 }
 async function enviar(letra) {
   if (!car) { $('msg').textContent = 'Primero conectá la máquina.'; return; }
-  try { await car.writeValue(new TextEncoder().encode(letra)); log('Enviado: ' + letra); }
+  try {
+    const d = new TextEncoder().encode(letra);
+    if (carTx.properties.writeWithoutResponse) await carTx.writeValueWithoutResponse(d); else await carTx.writeValue(d);
+    log('Enviado: ' + letra);
+  }
   catch (e) { $('msg').textContent = 'No se pudo enviar: ' + e.message; }
 }
 
